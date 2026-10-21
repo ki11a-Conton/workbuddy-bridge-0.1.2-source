@@ -15,26 +15,52 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
+
+// localProxy is the machine-local proxy (Clash Verge mixed port). Direct
+// outbound access to the international WorkBuddy endpoints is blocked on this
+// host, so every upstream call goes through it explicitly. It is a var (not a
+// const) only so tests can point it at an unused port and exercise the
+// proxy-off code path without touching the real Clash Verge listener.
+var localProxy = "http://127.0.0.1:7897"
+
+// proxyDialTimeout bounds the dial to the machine-local proxy (and the proxy's
+// own connect to its upstream). With the proxy off, dialing 127.0.0.1:7897
+// fails in milliseconds; with the proxy on but its upstream hung, the dial
+// also fails here instead of stretching to the 600s client ceiling — that
+// keeps CPA startup and model listing responsive while the proxy is unhealthy.
+const proxyDialTimeout = 3 * time.Second
 
 var (
 	sharedOnce sync.Once
 	sharedHTTP *http.Client
 )
 
+func proxiedTransport() *http.Transport {
+	dialer := &net.Dialer{Timeout: proxyDialTimeout}
+	return &http.Transport{
+		Proxy: func(*http.Request) (*url.URL, error) { return url.Parse(localProxy) },
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, addr)
+		},
+		// Fall back to env proxy (HTTP(S)_PROXY) when the local proxy is unset.
+		MaxIdleConns:        20,
+		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConnsPerHost: 5,
+	}
+}
+
 func httpClient() *http.Client {
 	sharedOnce.Do(func() {
 		sharedHTTP = &http.Client{
-			Timeout: 600 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        20,
-				IdleConnTimeout:     90 * time.Second,
-				MaxIdleConnsPerHost: 5,
-			},
+			Timeout:   600 * time.Second,
+			Transport: proxiedTransport(),
 		}
 	})
 	return sharedHTTP
@@ -110,7 +136,7 @@ func fetchCatalogBytes(ctx context.Context, c *credential) ([]byte, error) {
 	for k, v := range catalogHeaders(c, appVersionFallback) {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: proxiedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("catalog transport: %w", err)
@@ -132,7 +158,7 @@ func fetchCreditsBytes(ctx context.Context, c *credential) ([]byte, error) {
 	for k, v := range billingHeaders(c) {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: proxiedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("billing transport: %w", err)

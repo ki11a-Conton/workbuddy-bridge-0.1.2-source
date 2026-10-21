@@ -73,7 +73,7 @@ const (
 	// dsh-workbuddy-bridge origin of this port while staying clearly distinct
 	// from the cpa-multi-plugins "workbuddy" plugin.
 	providerName  = "workbuddy-bridge"
-	pluginVersion = "0.1.2"
+	pluginVersion = "0.1.4"
 	// pluginLogo is the WorkBuddy AI brand mark served by the management UI.
 	pluginLogo = ""
 )
@@ -198,6 +198,13 @@ func streamClose(streamID string) error {
 type envelopeError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// HTTPStatus mirrors pluginabi.Error.HTTPStatus: the host's envelope decode
+	// feeds it into rpcError.StatusCode(), which MarkResult uses for the
+	// per-status credential cooldown (402 -> 30m, 429 -> quota backoff,
+	// 401 -> 30m). Without it every plugin failure looks status-less to the
+	// host, so a request-shaped 11128 rejection cools the credential and the
+	// next call dies with 503 auth_unavailable.
+	HTTPStatus int `json:"http_status,omitempty"`
 }
 
 type rpcEnvelope struct {
@@ -216,7 +223,19 @@ func errorEnvelope(code, message string) []byte {
 	return raw
 }
 
+// errorEnvelopeFor serializes a handler error, preserving the upstream HTTP
+// status when the error carries one (statusError / any StatusCode() impl). The
+// status crosses the RPC boundary as envelope error http_status and drives the
+// host's real per-status credential cooldown — see upstreamStatusError for the
+// account-level vs request-level policy.
 func errorEnvelopeFor(err error) []byte {
+	var sc interface{ StatusCode() int }
+	if errors.As(err, &sc) && sc.StatusCode() > 0 {
+		raw, _ := json.Marshal(rpcEnvelope{OK: false, Error: &envelopeError{
+			Code: "plugin_error", Message: err.Error(), HTTPStatus: sc.StatusCode(),
+		}})
+		return raw
+	}
 	return errorEnvelope("internal", err.Error())
 }
 
@@ -247,9 +266,9 @@ type registrationCapability struct {
 }
 
 type registration struct {
-	SchemaVersion uint32                     `json:"schema_version"`
-	Metadata      pluginapi.Metadata         `json:"metadata"`
-	Capabilities  registrationCapability     `json:"capabilities"`
+	SchemaVersion uint32                 `json:"schema_version"`
+	Metadata      pluginapi.Metadata     `json:"metadata"`
+	Capabilities  registrationCapability `json:"capabilities"`
 }
 
 func wbaiRegistration() registration {

@@ -2,12 +2,23 @@
 // roster is per-account), and ModelsForAuth fetches the international /v3/config
 // document with that account's identity (app-shaped UA), caches it five
 // minutes, and maps the cli-roster rows into pluginapi.ModelInfo.
+//
+// Proxy independence: the catalog probe goes through the machine-local proxy
+// (Clash Verge 7897). When the proxy is NOT running (or the upstream is
+// unreachable), the fetch must NOT hard-fail: a hard error makes the host skip
+// model registration entirely (so the models disappear and the log fills with
+// "models for auth ... failed" per auth) and CPA startup looks broken. Instead
+// a failed probe degrades to the static allow-list, so the models stay
+// registered in CPA at all times — they answer requests when the proxy is up
+// and fail with a clean transport error when it is down (exactly "proxy on =>
+// usable, proxy off => unusable, startup unaffected").
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +35,21 @@ type catalogEntry struct {
 
 const catalogTTL = 5 * time.Minute
 
+// staticFallback is the offline allow-list used when the live catalog is
+// unreachable (proxy down / upstream blocked). Keep it in sync with the
+// cli-roster ids of the international /v3/config document.
+var staticFallback = []modelInfo{
+	{ID: "deepseek-v4.1-flash", Name: "DeepSeek V4.1 Flash",
+		MaxInputTokens: 262144, MaxOutputTokens: 8192},
+}
+
+// lastCatalogLogAt throttles the repeated "catalog fetch failed" log so 31
+// auths do not spam startup output.
+var (
+	lastCatalogLogMu sync.Mutex
+	lastCatalogLogAt time.Time
+)
+
 func catalogFor(ctx context.Context, c *credential) ([]modelInfo, error) {
 	if v, ok := catalogCache.Load(c.UID); ok {
 		e := v.(catalogEntry)
@@ -32,15 +58,29 @@ func catalogFor(ctx context.Context, c *credential) ([]modelInfo, error) {
 		}
 	}
 	raw, err := fetchCatalogBytes(ctx, c)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		models, _, parseErr := parseCatalog(raw)
+		if parseErr != nil {
+			log.Printf("wbai catalog: uid=%s parse err=%v (using fallback)", c.UID, parseErr)
+		} else {
+			log.Printf("wbai catalog: uid=%s body=%dB models=%d", c.UID, len(raw), len(models))
+			catalogCache.Store(c.UID, catalogEntry{at: time.Now(), models: models})
+			return models, nil
+		}
+	} else {
+		// Proxy down / upstream unreachable: degrade to the static list instead
+		// of erroring, and keep the log quiet (rate-limited).
+		lastCatalogLogMu.Lock()
+		quiet := time.Since(lastCatalogLogAt) < 30*time.Second
+		if !quiet {
+			lastCatalogLogAt = time.Now()
+		}
+		lastCatalogLogMu.Unlock()
+		if !quiet {
+			log.Printf("wbai catalog: uid=%s fetch err=%v (proxy offline? using static fallback)", c.UID, err)
+		}
 	}
-	models, _, err := parseCatalog(raw)
-	if err != nil {
-		return nil, err
-	}
-	catalogCache.Store(c.UID, catalogEntry{at: time.Now(), models: models})
-	return models, nil
+	return staticFallback, nil
 }
 
 func handleModelStatic(raw []byte) ([]byte, error) {

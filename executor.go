@@ -30,22 +30,44 @@ func payloadOf(req pluginapi.ExecutorRequest) []byte {
 }
 
 // upstreamBody prepares the outgoing body and rewrites the model id: the host
-// passes the client-facing, provider-prefixed name ("workbuddy-bridge/
-// deepseek-v4.1-flash"), while the international upstream only knows the raw
-// catalog id ("deepseek-v4.1-flash") — a prefixed name 400s with code 11102
-// ("model [...] service info not found"). Mirrors the workbuddy plugin's
-// resolveUpstreamModel prefix handling.
+// passes a client-facing name — either the provider-prefixed form
+// ("workbuddy-bridge/deepseek-v4.1-flash") or an oauth-model-alias id
+// ("workbuddy-bridge-deepseek-v4.1-flash") — while the international upstream
+// only knows the raw catalog id ("deepseek-v4.1-flash"); any wrapped name is
+// rejected upstream with code 11102 ("model [...] service info not found").
+// The host-resolved upstream id (req.Model) wins when provided.
 func upstreamBody(req pluginapi.ExecutorRequest) []byte {
 	body := prepareIntlBody(payloadOf(req))
 	obj, ok := parseObjectBody(body)
 	if !ok {
 		return body
 	}
-	if m, ok := obj["model"].(string); ok && strings.HasPrefix(m, providerName+"/") {
-		obj["model"] = strings.TrimPrefix(m, providerName+"/")
+	bodyModel, _ := obj["model"].(string)
+	target := normalizeUpstreamModel(req.Model)
+	if target == "" {
+		target = normalizeUpstreamModel(bodyModel)
+	}
+	if target != "" && target != bodyModel {
+		obj["model"] = target
 		return mustJSON(obj)
 	}
 	return body
+}
+
+// normalizeUpstreamModel maps any client-facing spelling of a catalog model id
+// back to the raw id the upstream accepts ("workbuddy-bridge/<id>" and
+// "workbuddy-bridge-<id>" both become "<id>"; a bare id passes through).
+func normalizeUpstreamModel(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, providerName+"/") {
+		s = strings.TrimPrefix(s, providerName+"/")
+	} else if strings.HasPrefix(s, providerName+"-") {
+		s = strings.TrimPrefix(s, providerName+"-")
+	}
+	return strings.TrimSpace(s)
 }
 
 func credentialOf(req pluginapi.ExecutorRequest) (*credential, error) {
@@ -68,8 +90,10 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
-		return nil, fmt.Errorf("upstream http %d: %s", resp.StatusCode, truncateBody(raw))
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
+		payload := string(errBody)
+		return nil, upstreamStatusError(resp.StatusCode, payload,
+			fmt.Errorf("upstream http %d: %s", resp.StatusCode, truncateBody(errBody)))
 	}
 	completion, err := aggregateCompletion(resp.Body, req.Model)
 	if err != nil {
@@ -93,9 +117,11 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("upstream transport: %w", err)
 	}
 	if upstream.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(io.LimitReader(upstream.Body, errorBodyLimit))
+		errBody, _ := io.ReadAll(io.LimitReader(upstream.Body, errorBodyLimit))
 		upstream.Body.Close()
-		return nil, fmt.Errorf("upstream http %d: %s", upstream.StatusCode, truncateBody(raw))
+		payload := string(errBody)
+		return nil, upstreamStatusError(upstream.StatusCode, payload,
+			fmt.Errorf("upstream http %d: %s", upstream.StatusCode, truncateBody(errBody)))
 	}
 
 	headers := streamHeaders()
@@ -300,9 +326,9 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		Model   string `json:"model"`
 		Created int64  `json:"created"`
 		Choices []struct {
-			Index        int        `json:"index"`
-			Delta        chatDelta  `json:"delta"`
-			FinishReason *string    `json:"finish_reason"`
+			Index        int       `json:"index"`
+			Delta        chatDelta `json:"delta"`
+			FinishReason *string   `json:"finish_reason"`
 		} `json:"choices"`
 		Usage *struct {
 			PromptTokens int `json:"prompt_tokens"`
@@ -310,11 +336,15 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		} `json:"usage"`
 	}
 	var (
-		id, respModel string
-		created       int64
-		content, reason, role strings.Builder
-		finish        string
-		usage         *chatChunk
+		id, respModel   string
+		created         int64
+		content, reason strings.Builder
+		// role is single-valued: the upstream repeats "role":"assistant" in
+		// every delta frame, so it must be taken once rather than accumulated
+		// (the previous strings.Builder produced "assistantassistant...").
+		role   string
+		finish string
+		usage  *chatChunk
 	)
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 256*1024), 8*1024*1024)
@@ -344,8 +374,8 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		}
 		if len(ch.Choices) > 0 {
 			d := ch.Choices[0].Delta
-			if d.Role != "" {
-				role.WriteString(d.Role)
+			if d.Role != "" && role == "" {
+				role = d.Role
 			}
 			content.WriteString(d.Content)
 			reason.WriteString(d.Reason)
@@ -373,11 +403,11 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	if finish == "" {
 		finish = "stop"
 	}
-	if role.Len() == 0 {
-		role.WriteString("assistant")
+	if role == "" {
+		role = "assistant"
 	}
 	message := map[string]any{
-		"role":    role.String(),
+		"role":    role,
 		"content": content.String(),
 	}
 	if reason.Len() > 0 {
