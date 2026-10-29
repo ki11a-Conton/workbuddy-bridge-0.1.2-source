@@ -8,6 +8,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -114,12 +115,33 @@ func commonHeaders() map[string]string {
 	}
 }
 
+// newUUID returns a random RFC 4122 version-4 UUID.
+//
+// It exists only to fill the three X-Conversation-* headers the international
+// gateway's channel verification demands on every chat call.
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 // chatHeaders builds the chat request headers. userAgent carries the desktop
 // identity; Authorization carries the access token (never the refresh token).
 func chatHeaders(c *credential, userAgent string) map[string]string {
 	h := commonHeaders()
 	h["User-Agent"] = userAgent
 	h["Content-Type"] = "application/json"
+	// Channel verification (upstream tightened 2026-10-15/16): every chat call
+	// must carry the three X-Conversation-* headers. Without them an otherwise
+	// valid request is rejected with HTTP 400 code 11128 ("request illegal",
+	// displayTips: "this call failed channel verification, possibly because it
+	// was not sent from an official client") before any model work happens.
+	// Verified live: the identical body returns SSE 200 with these present.
+	h["X-Conversation-ID"] = newUUID()
+	h["X-Conversation-Message-ID"] = newUUID()
+	h["X-Conversation-Request-ID"] = newUUID()
 	if c.UID == "" {
 		h["X-No-User-Id"] = "1"
 	} else {
@@ -203,6 +225,7 @@ func prepareChatBody(raw []byte) []byte {
 	obj["stream"] = true
 	normalizeDeveloperRole(obj)
 	normalizeToolChoice(obj)
+	sanitizeBlockedPhrases(obj)
 	return mustJSON(obj)
 }
 

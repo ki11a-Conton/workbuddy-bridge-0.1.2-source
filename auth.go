@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -21,7 +22,7 @@ import (
 func isOursAuthFile(fileName, declaredType string) bool {
 	t := strings.ToLower(strings.TrimSpace(declaredType))
 	switch t {
-	case "workbuddy-ai", "workbuddy-global", "workbuddy":
+	case "workbuddy-ai", "workbuddy-global", "workbuddy", providerName:
 		return true
 	}
 	lower := strings.ToLower(strings.TrimSpace(fileName))
@@ -94,8 +95,10 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	}
 	next, err := refreshCredential(context.Background(), c)
 	if err != nil {
+		log.Printf("wbai refresh: uid=%s err=%v", c.UID, err)
 		return nil, err
 	}
+	log.Printf("wbai refresh: uid=%s ok", c.UID)
 	// Patch the persisted credential JSON with the fresh tokens.
 	var doc cpaAuthFile
 	if err := json.Unmarshal(req.StorageJSON, &doc); err != nil {
