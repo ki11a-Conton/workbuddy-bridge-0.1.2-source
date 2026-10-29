@@ -73,7 +73,7 @@ const (
 	// dsh-workbuddy-bridge origin of this port while staying clearly distinct
 	// from the cpa-multi-plugins "workbuddy" plugin.
 	providerName  = "workbuddy-bridge"
-	pluginVersion = "0.1.4"
+	pluginVersion = "0.1.5"
 	// pluginLogo is the WorkBuddy AI brand mark served by the management UI.
 	pluginLogo = ""
 )

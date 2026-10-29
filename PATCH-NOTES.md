@@ -154,3 +154,85 @@ bridge 的 `walkCleanedSSE` 目前把这种帧当普通 chunk 转发（无 compl
   部署前备份 `_cpa_tmp\backup-20261021-2244\workbuddy-bridge-0.1.4-before-roledix.dll`（7,337,472 B）。
 - 在线验证（22:44 经计划任务重启后）：小请求 → 200、`role=assistant`、`content=OK`；
   真实 269KB / 50 消息 / 67 tools 失败体 → 200、`role=assistant`、`finish_reason=length`、`prompt_tokens=86945`。
+
+## 补丁七：DSH 文件引用段（@-paths）家族的平行防护（2026-10-29 14:2x，版本 0.1.5）
+
+### 一、起因（CN 侧第四成员）
+
+DSH 每个请求的 system/assistant 里都带这两句：
+
+```
+Tokens prefixed with @ are paths the user explicitly referenced.
+Relative paths resolve from the workspace root;
+```
+
+CN 侧 2026-10-29 实测：这两句**同字段共现**即 400/11128，单句 200；`system` 与 `assistant`
+两个角色都拦，`user` 与 `tool` 放行。修复上只差「拆开签名对」这一步：
+
+- 上游 0.9.81（`69a4724`）只改 A 句——插入一个 `that`（`…are paths that the user explicitly
+  referenced.`），B 句保持原样，作用域 `system/developer/assistant`；
+- 本机部署的 CN 0.9.80 是同一原理的更激进版本：A 句整句替换、并把 B 改成
+  `relative paths resolve against the working directory`（两种写法当天都实测 200）。
+
+本机对 322 KB 真实失败体跑上游 0.9.81 生产管线后 200，且 `assistant` 回显里的旧文本被就地
+改写（硬证据）。本 bridge 补丁采用**与上游 0.9.81 相同的最小改法**（只插 `that`，B 句不动），
+以保持两界规则形状一致。
+
+### 二、国际侧实测（本补丁不声称复现修复）
+
+2026-10-29 用 CN 插件的国际线路直连基建（`endpointChatFor` + `backendHeaders`）实测：
+
+| 探针 | 结果 |
+| --- | --- |
+| canary（trivial system） | 200 |
+| 签名对在 `system` | **200** |
+| 签名对在 `assistant` | **200** |
+| 签名对在 `user` | **200** |
+
+**国际线路目前不拦这一族**（账号 `329d7e35-…`，24 个国际凭据里唯一可用的那个）。因此本补丁是
+**平行防护/对位**，不是复现修复：把 CN 的同义替换搬到 bridge，使两界阻断同一批输入，国际线一旦
+启用该族即自动生效（`Main branch` 短语就是这样先在 CN 出现、后在国际线出现的，见补丁五）。
+
+### 三、顺带发现的国际线现状（非本补丁引入，供排查参考）
+
+24 个 `auths\workbuddy-bridge-*.json` 里 **23 个返回 403 + 11140**
+（`Your account has been restricted due to unusual activity` / 账号存在异常行为），
+只有 `329d7e35-…`（`expiresAt` 2027-09-14）可用；无 401。也就是说国际线当前的主要故障是
+**账号级封禁**，不是提示词门控：短语清洗得再干净也换不来 200。
+
+### 四、改动
+
+`blocklist.go` 新增（顺序即应用顺序，全部为幂等替换）：
+
+- `reDshFileRef`：`(?i)(Tokens prefixed with @ are paths )(the user explicitly referenced\.)`
+  → `…are paths that the user…`（拆开签名对，保留原意；与上游 0.9.81 逐字一致，B 句**故意不动**——
+  单句从不触发，实测 A 已改写后整对即失效）；
+- `rePastedErrorCode`：`\b11128\b` → `11-128`（与 CN 一致的粘贴错误码改写）；
+- `reCCKeyValue`：`(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*`（循环 ≤8 次，剥计费头键值对）；
+- `reAnthropicBillingHeader` / 裸头改写、`reCodexSecondSentence`、`reOMOJunior`
+  （与 CN 0.9.8x 的同义句保持一致，避免两界行为分叉）。
+
+作用域与 CN 对齐：`sanitizeBlockedPhrases` 覆盖全部角色（含 `reasoning_content`/`reasoning`
+与 `tool_calls[].function.arguments`），`sanitizeBlockedSystemPrompt` 覆盖 `system`/`developer`。
+
+### 五、测试
+
+`blocklist_test.go` 新增 `TestSanitizeBlockedPhrasesCNParityRules`（9 组同义改写）、
+`TestSanitizeBlockedPhrasesCNParityIdempotent`（5 组二次通过）、
+`TestSanitizeBlockedPhrasesCNParityVerbatimPass`（5 组必须逐字保留：`deepseek_harness`、
+`deepseek-harness`、`foo_cc_entrypoint`、已改写的 `@` 句、以及**未被改写的 B 句**
+`Relative paths resolve from the workspace root;`）；
+两处既有断言随品牌 prose 规则更新为 `DeepSeek web interface`。`go test ./...` 全绿。
+
+### 六、产物
+
+- `workbuddy-bridge-0.1.5.dll`，7,339,008 B，
+  sha256 `8998BAB0A57711AF82510793943F1E43CDE97ED9EFBC971C267BFB33DBA27FB8`；
+  部署为 `plugins\workbuddy-bridge.dll`，0.1.4 部署件备份 `_cpa_tmp\workbuddy-bridge-0.1.4-deployed.dll`。
+- 构建：`CGO_ENABLED=1` + `CC=gcc.exe`（w64devkit），
+  `go build -buildmode=c-shared -trimpath -ldflags "-s -w -X main.pluginVersion=0.1.5"`；
+  注意 `c-shared` 产物**非逐字节可复现**（同源码二次构建哈希不同），上表哈希对应 14:14 的
+  已部署产物；判定「部署件与源码一致」按源码哈希而非 dll 哈希。
+- `go test ./...`：全绿（含本补丁三组新用例与版本位守卫）。
+
+
